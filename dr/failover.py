@@ -34,14 +34,76 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 LOG = pathlib.Path("reports/failover-events.jsonl")
 
 
+ACTIVE = pathlib.Path("edge/active_region")
+
+
 def emit(**kw):
-    """TODO: append 1 dòng JSONL có ts + iso vào LOG, và print ra stdout."""
-    raise NotImplementedError
+    """Append 1 dòng JSONL có ts + iso vào LOG, và print ra stdout."""
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), **kw}
+    with LOG.open("a") as f:
+        f.write(json.dumps(rec) + "\n")
+    print("FAILOVER", json.dumps(rec), flush=True)
+    return rec
+
+
+def state_of(region: str) -> dict:
+    try:
+        return httpx.get(f"{URL[region]}/v1/state", timeout=2.0).json()
+    except Exception as e:
+        return {"region": region, "error": type(e).__name__}
 
 
 def failover(target: str, backend: str, wait: float) -> dict:
-    """TODO: 5 bước ở trên, đúng thứ tự."""
-    raise NotImplementedError
+    """5 bước, đúng thứ tự. Bước 4 timeout -> ABORT, không đụng vào edge/active_region."""
+    primary = "a" if target == "b" else "b"
+    result = {"ok": False, "target": target, "primary": primary}
+
+    emit(step="1_verify_target", target=target, state=state_of(target))
+
+    try:
+        meta = snapshot.get(target, backend)
+        r = snapshot.rpo(pathlib.Path(f"state/region-{primary}/vectors.sqlite"),
+                         pathlib.Path(f"state/region-{target}/vectors.sqlite"))
+    except BaseException as e:  # snapshot.get dùng SystemExit khi chưa có snapshot
+        emit(step="2_restore_snapshot", target=target, ok=False, error=str(e))
+        result["error"] = f"restore_failed: {e}"
+        return result
+    emit(step="2_restore_snapshot", target=target, ok=True, backend=backend,
+         snapshot_at=meta.get("snapshot_at"), embed_model_version=meta.get("embed_model_version"),
+         rpo_seconds=r["rpo_seconds"], docs_lost=r["docs_lost"])
+    result.update(rpo_seconds=r["rpo_seconds"], docs_lost=r["docs_lost"],
+                  embed_model_version=meta.get("embed_model_version"))
+
+    pool = pathlib.Path(f"state/region-{target}/pool_state")
+    pool.parent.mkdir(parents=True, exist_ok=True)
+    pool.write_text("full")
+    emit(step="3_scale_pool", target=target, pool_state="full")
+
+    t0, ready, body = time.time(), False, None
+    while time.time() - t0 < wait:
+        try:
+            resp = httpx.get(f"{URL[target]}/readyz", timeout=2.0)
+            body = resp.json()
+            if resp.status_code == 200:
+                ready = True
+                break
+        except Exception as e:
+            body = {"error": type(e).__name__}
+        time.sleep(0.5)
+    waited = round(time.time() - t0, 2)
+    emit(step="4_wait_ready", target=target, ready=ready, waited_s=waited, readyz=body)
+    result["waited_s"] = waited
+    if not ready:
+        emit(step="abort", target=target, reason=f"target chua ready sau {wait}s -> KHONG cutover")
+        result["error"] = "target_not_ready"
+        return result
+
+    ACTIVE.write_text(target)
+    emit(step="5_dns_cutover", target=target, active_region=target)
+    st = state_of(target)
+    result.update(ok=True, cutover=True, vectors=st.get("count"), weights=st.get("weights"))
+    return result
 
 
 if __name__ == "__main__":

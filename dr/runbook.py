@@ -33,24 +33,107 @@ import httpx
 
 sys.path.insert(0, ".")
 from dr import failover as fo  # noqa: E402
+from dr import health_checker as hc  # noqa: E402
 
 LOG = pathlib.Path("reports/runbook-run.jsonl")
+HEALTH = pathlib.Path("reports/health-events.jsonl")
+CHAOS = pathlib.Path("chaos/chaos-events.jsonl")
 URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
+def _jsonl(p: pathlib.Path) -> list[dict]:
+    return [json.loads(l) for l in p.read_text().splitlines() if l.strip()] if p.exists() else []
+
+
 def step(n, name, **kw):
-    """TODO: ghi 1 dòng {ts, iso, step, name, ...} vào LOG."""
-    raise NotImplementedError
+    """Ghi 1 dòng {ts, iso, step, name, ...} vào LOG."""
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+           "step": n, "name": name, **kw}
+    with LOG.open("a") as f:
+        f.write(json.dumps(rec) + "\n")
+    print("RUNBOOK", json.dumps(rec), flush=True)
+    return rec
 
 
 def confirm(auto: bool, msg: str) -> bool:
-    """TODO: auto=True -> True; ngược lại hỏi y/N. Đừng bỏ hàm này đi."""
-    raise NotImplementedError
+    """auto=True -> True; ngược lại hỏi y/N (bán tự động, chống flapping)."""
+    if auto:
+        return True
+    return input(f"{msg} [y/N] ").strip().lower() == "y"
+
+
+def wait_for_alert(primary: str, since: float, timeout: float) -> dict | None:
+    """Chờ health checker bắn alert UNHEALTHY cho primary -- không tin 1 lần probe fail."""
+    end = time.time() + timeout
+    while time.time() < end:
+        for e in _jsonl(HEALTH):
+            if (e.get("event") == "state_change" and e.get("region") == primary
+                    and e.get("to") == "UNHEALTHY" and e["ts"] >= since):
+                return e
+        time.sleep(0.5)
+    return None
 
 
 def run(primary: str, target: str, backend: str, auto: bool) -> dict:
-    """TODO: 7 bước ở trên."""
-    raise NotImplementedError
+    t_start = time.time()
+    kills = [e for e in _jsonl(CHAOS) if e.get("action") == "kill" and e.get("region") == primary]
+    t_outage = kills[-1]["ts"] if kills else None
+
+    # 1. Xác nhận outage: alert từ health checker + tự probe lại cả 2 region
+    alert = wait_for_alert(primary, t_outage or t_start - 60, timeout=120)
+    probes = {r: hc.probe(r, 2.0) for r in (primary, target)}
+    outage = alert is not None and not probes[primary][0]
+    step(1, "xac_nhan_outage", confirmed=outage, alert=alert,
+         probes={r: {"ready": ok, "reason": why} for r, (ok, why) in probes.items()})
+    if not outage:
+        step(7, "post_incident", aborted=True, reason="khong xac nhan duoc outage",
+             elapsed_s=round(time.time() - t_start, 2))
+        return {"ok": False, "reason": "outage_not_confirmed"}
+
+    # 2. Thông báo incident + bấm giờ
+    t_known = time.time()
+    step(2, "thong_bao_incident", t_outage=t_outage, t_detect=alert["ts"],
+         t_operator_known=t_known,
+         notify_delay_s=None if t_outage is None else round(t_known - t_outage, 2),
+         msg=f"SEV1: region-{primary} down, failover sang region-{target}")
+
+    # 3. Failover (gọi đúng 1 lần)
+    if not confirm(auto, f"Failover tu region-{primary} sang region-{target}?"):
+        step(3, "scale_gpu_pool", skipped=True, reason="operator tu choi")
+        return {"ok": False, "reason": "operator_declined"}
+    res = fo.failover(target, backend, wait=60)
+    step(3, "scale_gpu_pool", failover_ok=res.get("ok"), waited_s=res.get("waited_s"))
+
+    # 4-5. Chỉ đọc lại kết quả failover
+    step(4, "verify_state_replica", vectors=res.get("vectors"), weights=res.get("weights"),
+         rpo_seconds=res.get("rpo_seconds"), docs_lost=res.get("docs_lost"),
+         embed_model_version=res.get("embed_model_version"))
+    step(5, "dns_cutover", ok=res.get("ok"), cutover=res.get("cutover", False),
+         error=res.get("error"))
+
+    # 6. Golden signals: 10 request thật vào region phụ
+    lat, errs = [], 0
+    for _ in range(10):
+        t = time.time()
+        try:
+            r = httpx.get(f"{URL[target]}/v1/infer", timeout=2.0)
+            if r.status_code != 200 or "error" in r.json():
+                errs += 1
+        except Exception:
+            errs += 1
+        lat.append((time.time() - t) * 1000)
+    lat.sort()
+    step(6, "verify_golden_signals", requests=10, p95_ms=round(lat[int(0.95 * (len(lat) - 1))], 1),
+         error_rate=errs / 10)
+
+    # 7. Post-incident
+    elapsed = round(time.time() - t_start, 2)
+    step(7, "post_incident", elapsed_s=elapsed,
+         measure_cmd="python3 tools/measure_rto.py --loadgen reports/drill-2-withdr.jsonl "
+                     "--target-rto 300")
+    return {"ok": bool(res.get("ok")), "elapsed_s": elapsed, "failover": res,
+            "error_rate": errs / 10}
 
 
 if __name__ == "__main__":

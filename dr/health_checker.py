@@ -29,13 +29,48 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
+    try:
+        r = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+    except Exception as e:
+        return False, type(e).__name__
+    if r.status_code == 200:
+        return True, "ok"
+    try:
+        reasons = ",".join(r.json().get("reasons", []))
+    except Exception:
+        reasons = ""
+    return False, f"http_{r.status_code}:{reasons}"
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Poll cả 2 region; chỉ ghi JSONL khi trạng thái đổi (sau `threshold` lần fail liên tiếp)."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    state = {r: "HEALTHY" for r in URL}
+    fails = {r: 0 for r in URL}
+    end = time.time() + duration
+    with out.open("a") as f:
+        while time.time() < end:
+            for region in URL:
+                ok, reason = probe(region, timeout)
+                fails[region] = 0 if ok else fails[region] + 1
+                new = state[region]
+                if not ok and fails[region] >= threshold:
+                    new = "UNHEALTHY"
+                elif ok:
+                    new = "HEALTHY"
+                if new != state[region]:
+                    rec = {"ts": time.time(),
+                           "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                           "event": "state_change", "region": region,
+                           "from": state[region], "to": new, "reason": reason,
+                           "consecutive_fails": fails[region],
+                           "interval_s": interval, "threshold": threshold}
+                    state[region] = new
+                    f.write(json.dumps(rec) + "\n")
+                    f.flush()
+                    print("HEALTH", json.dumps(rec), flush=True)
+            time.sleep(interval)
 
 
 if __name__ == "__main__":
